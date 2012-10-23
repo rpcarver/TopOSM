@@ -20,6 +20,7 @@ if not 'TOPOSM_ENV_SET' in os.environ:
 BASE_TILE_DIR = os.environ['BASE_TILE_DIR']
 CONTOURS_TABLE = os.environ['CONTOURS_TABLE']
 DATABASE = os.environ['DB_NAME']
+DBUSER = os.environ['DB_USER']
 TEMPDIR = os.environ['TEMP_DIR']
 NED13DIR = os.environ['NED13_DIR']
 COLORFILE = os.environ['COLORFILE']

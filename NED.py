@@ -130,8 +130,8 @@ def prepDataFile(basename, env):
 
                 print '  Importing contour lines...'
                 # NOTE: this assumes that the table is already set up
-                cmd = 'shp2pgsql -a -g way "%s" "%s" | psql -q "%s"' % \
-                    (contourfileproj, CONTOURS_TABLE, DATABASE)
+                cmd = 'shp2pgsql -a -g way "%s" "%s" | psql -q "%s" "%s"' % \
+                    (contourfileproj, CONTOURS_TABLE, DATABASE, DBUSER)
                 os.system(cmd)
                 
                 # Clear contents (but keep file to prevent us from importing

@@ -70,7 +70,7 @@ def writeEmpty(filename):
         fslock.release()
 
 def runSql(sql):
-    command = "psql -d %s -q -c \"%s\"" % (DATABASE, sql)
+    command = "psql -d %s -q -c \"%s\" %s" % (DATABASE, sql, DBUSER)
     print command
     os.system(command)
 
