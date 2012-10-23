@@ -26,7 +26,7 @@ STEP = 0.5
 
 def getTilepath(basename):
     return os.path.join(
-        NED13DIR, basename + '.tif')
+        NED13DIR, basename + '.flt')
 
 def getTiles(envLL):
     """Gets the (basename, Box2d) of all (existing) 1/3 NED tiles

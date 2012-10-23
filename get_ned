@@ -2,16 +2,39 @@
 
 # downloads NED data for the specified region
 
+if [[ -z $TOPOSM_ENV_SET ]]; then
+echo "Error: TopOSM environment not set."
+    exit 1
+fi
+
 # TODO: fix zero-prefixed west coordinates
 
-W=126
-N=44
-E=112
-S=31
+W=$(($XMINLL * -1))
+N=$YMAXLL
+E=$(($XMAXLL * -1))
+S=$YMINLL
 
-SRC="http://openstreetmap.us/ned/13arcsec/grid"
+pushd $NED13_DIR
+
+echo "Downloading NED data for BBOX($S $W, $N $E)"
+SRC="http://tdds.cr.usgs.gov/ned/13arcsec/float/float_zips"
 for n in `seq $S $N` ; do
     for w in `seq $E $W`; do
-	wget -r --no-parent --no-host-directories --cut-dirs=3 "$SRC/n${n}w${w}"
+        NAME=n${n}w${w}
+        if [ -d $NAME \
+            -o -s $NAME.zip \
+            -o -s $NAME.flt ]; then
+           echo "$NAME appears to exist already...skipping"
+        else
+            wget "$SRC/$NAME.zip"
+            unzip $NAME.zip
+            if [ -s $NAME/float${NAME}_13 ]; then
+                mv $NAME/float${NAME}_13 $NAME.flt
+            fi
+            rename "s/$NAME\/float${NAME}_13/$NAME/" $NAME/float${NAME}_13.*
+            rm -rf $NAME
+        fi
     done
 done
+
+popd
