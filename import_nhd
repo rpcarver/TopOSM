@@ -1,111 +1,222 @@
 #!/bin/bash
 
+##  This script downloads all the NHD Data necessary given the bounding box supplied
+##  and then imports it into the database.  The idea is for the NHD database to grow
+##  over time, so subregions are only imported if they don't have a marker in the cache directory
+##  Use NO_NHD_CACHE to prevent this behavior, resulting in new tables being created each run
+
+
+## These names are manually created by the FTP owner... likely to change
+WBD_PATH="ftp://ftp.ftw.nrcs.usda.gov/wbd"
+WBD_ZIP="wbdhu4_a_us_July2012.gdb.zip"
+WBD_GDB="WBDHU4_July2012.gdb"
+
+NHD_PATH="ftp://nhdftp.usgs.gov/DataSets/Staged/SubRegions/PersonalGDB/HighResolution"
+NHD_ZIP="NHDH%s_931v210.zip"
+NHD_GDB="NHDH%s.mdb"
+
+WBD_TABLE="wbd_subregions"
+
+
 if [[ -z $TOPOSM_ENV_SET ]]; then
     echo "Error: TopOSM environment not set."
     exit 1
 fi
 
-SETUPCMD="shp2pgsql -p -I -g way -W latin1"
-IMPORTCMD="shp2pgsql -a -g way -W latin1"
-DBCMD="psql -q -p $DB_PORT $DB_NAME $DB_USER"
+W=$(($XMINLL * -1))
+N=$YMAXLL
+E=$(($XMAXLL * -1))
+S=$YMINLL
+
+SETUPCMD="shp2pgsql -p -I -i -g way -W latin1"
+IMPORTCMD="shp2pgsql -a -i -g way -W latin1 -D"
+DBCMD="psql -q -t -p $DB_PORT -d $DB_NAME -U $DB_USER"
 TEMPDIR="temp"
+CACHEDIR="cache"
 SRS900913="+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +no_defs +over"
-TEMPFILE="$TEMPDIR/temp.shp"
+TEMPFILENAME="temp"
+TEMPFILE="${TEMPDIR}/${TEMPFILENAME}.shp"
+
+Debug() {
+    if [[ ! -z $2 ]]; then
+	echo $1 1>&2
+    fi
+}
+
+## download the boundaries of all nhd subregions and stick in database
+## so that we can download just the subregions that intersect the bounding box
+MakeWBDTable() {
+    if [[ ! -s $WBD_ZIP && ! -d $WBD_GDB ]]; then
+	wget -nv $WBD_PATH/$WBD_ZIP
+    fi
+    if [[ ! -d $WBD_GDB && -s $WBD_ZIP ]]; then    
+	unzip $WBD_ZIP
+    fi
+    if [[ -d $WBD_GDB ]]; then
+	Debug "Importing WBD data to $WBD_TABLE" $TOPOSM_DEBUG
+	ogr2ogr -select "HUC_4" -f "PostgreSQL" -t_srs EPSG:4326 -gt 1024 \
+            PG:"dbname=$DB_NAME user=$DB_USER port=$DB_PORT" $WBD_GDB \
+            -lco GEOMETRY_NAME=geom -lco FID=fid -nln $WBD_TABLE WBD_HU4 > /dev/null 2>&1
+	if [ $? == 0 ]; then
+	    echo Imported `echo "SELECT count(*) FROM $WBD_TABLE;" | $DBCMD` records from $WBD_GDB to $WBD_TABLE
+	else
+	    echo Unable to import $WBD_GDB
+	fi
+    fi
+}
+
+GetSubregions() {
+    bbox_wkt="POLYGON(($W $S,$W $N,$E $N,$E $S,$W $S))"
+    Debug "Getting subregions that intersect $bbox_wkt" $TOPOSM_DEBUG
+    echo "
+SELECT DISTINCT huc_4 FROM $WBD_TABLE
+WHERE ST_Intersects(geom, ST_GeomFromText('$bbox_wkt', 4326));
+" | $DBCMD 
+}
+
+DownloadAndUnzip() {
+    subregion=$1
+    zip=`printf "$NHD_ZIP" $subregion`
+    gdb=`printf "$NHD_GDB" $subregion`
+
+    Debug "Downloading data for subregion $subregion" $TOPOSM_DEBUG
+    
+    if ls -U $CACHEDIR/$subregion* &> /dev/null; then
+	Debug "Region cached, no need to download" $TOPOSM_DEBUG
+    else
+	Debug "Region not cached" $TOPOSM_DEBUG
+	if [[ ! -s $zip && ! -s $gdb ]]; then
+	    wget -nv $NHD_PATH/$zip
+	    if [[ $? -ne 0 ]]; then
+		echo "
+******** ERROR: Unable to find file for subregion $subregion. ********
+ You will need to find the file manually or order from the NHD Viewer"
+	    fi
+	fi
+	if [[ ! -s $gdb && -s $zip ]]; then
+	    unzip $zip
+	fi
+    fi
+}
+
+TableExists() {
+    Debug "Checking to see if table $1 exists" $TOPOSM_DEBUG
+    echo "\d $1" | $DBCMD
+}
+
 
 
 # NOTE: The data type for fcode and ftype is changed because, for some
 # reason, mapnik (silently) fails to filter on bigint columns.
 
 ExtractMajorFeatures() {
-  TABLESUFFIX=$1
-  CONDITION="$2"
-  SRCTABLE="${NHD_TABLE_PREFIX}_${TABLESUFFIX}"
-  DSTTABLE="${SRCTABLE}_major"
-  echo "Extracting major features in $SRCTABLE..."
-  echo "INSERT INTO $DSTTABLE SELECT * FROM $SRCTABLE WHERE $CONDITION" | $DBCMD
-}
-
-UpdateColumnDatatypes() {
-  TABLESUFFIX=$1
-  TABLE="${NHD_TABLE_PREFIX}_${TABLESUFFIX}"
-  echo "Updating column datatypes in $TABLE..."
-  echo "ALTER TABLE $TABLE ALTER COLUMN fcode TYPE INT, ALTER COLUMN ftype TYPE INT" | $DBCMD
+    TABLESUFFIX=$1
+    CONDITION="$2"
+    SRCTABLE="${NHD_TABLE_PREFIX}_${TABLESUFFIX}"
+    DSTTABLE="${SRCTABLE}_major"
+    echo "Extracting major features in $SRCTABLE..."
+    echo "
+INSERT INTO $DSTTABLE
+SELECT * FROM $SRCTABLE
+WHERE $CONDITION
+  AND gid NOT IN (SELECT gid FROM $DSTTABLE)
+" | $DBCMD
 }
 
 CreateFcodeIndex() {
-  TABLESUFFIX=$1
-  TABLE="${NHD_TABLE_PREFIX}_${TABLESUFFIX}"
-  INDEXNAME="${TABLE}_fcode"
-  echo "Creating index $INDEXNAME..."
-  echo "CREATE INDEX $INDEXNAME ON $TABLE (fcode)" | $DBCMD
+    TABLE="$1"
+    INDEXNAME="${TABLE}_fcode"
+    echo "Creating index $INDEXNAME..."
+    echo "CREATE INDEX $INDEXNAME ON $TABLE (fcode)" | $DBCMD
 }
 
-ImportShapefiles() {
-  SHAPEFILEPREFIX=$1
-  TABLESUFFIX=$2
-  CREATE_MAJOR=$3
-  echo "Importing ${SHAPEFILEPREFIX} shapefiles..."
-  PREP_TABLE=1
-  for SRCFILE in $NHD_DIR/${SHAPEFILEPREFIX}*.shp; do
-    echo "Reprojecting $SRCFILE and applying bbox..."
-    ogr2ogr -t_srs "$SRS900913" \
-      -spat $XMINLL $YMINLL $XMAXLL $YMAXLL \
-      "$TEMPFILE" "$SRCFILE"
-    
-    # set up table(s)
-    if [ "$PREP_TABLE" ]; then 
-      echo "Creating ${NHD_TABLE_PREFIX}_area tables..."
-      $SETUPCMD "$TEMPFILE" ${NHD_TABLE_PREFIX}_${TABLESUFFIX} | $DBCMD
-      if [ ! -z $CREATE_MAJOR ]; then
-        $SETUPCMD "$TEMPFILE" ${NHD_TABLE_PREFIX}_${TABLESUFFIX}_major | $DBCMD
-      fi
-      unset PREP_TABLE
-    fi  
-    
-    # import data
-    echo "Importing $SRCFILE..."
-    $IMPORTCMD "$TEMPFILE" ${NHD_TABLE_PREFIX}_${TABLESUFFIX} | $DBCMD
-    
-    rm "$TEMPFILE"
-  done
-}   
+## either the geodatabases from NHD are messed up, or gdal isn't properly handling the
+## ogr2ogr call, because we have to convert from MDB to shapefile and then use shp2psql
+## to handle the cases where geometries may be either single or multi-geometries.
+ImportLayers() {
+    LAYERNAME=$1
+    TABLESUFFIX=$2
+    CREATE_MAJOR=$3
+    TABLE=${NHD_TABLE_PREFIX}_$TABLESUFFIX
+    PREP_TABLE=1
+    OPTION=""
 
-# Ensure that our temp directory exists
+    echo "Importing ${LAYERNAME}..."
+
+    for s in $SUBREGIONS; do
+	SRCFILE=`printf "$NHD_GDB" $s`
+	CACHEFILE=$CACHEDIR/${s}_$LAYERNAME
+	
+	## only import the data if it isn't already done
+	if [[ ! -a $CACHEFILE && -s $SRCFILE ]]; then
+	    
+	    echo "Reprojecting $SRCFILE..."
+	    ogr2ogr -overwrite -t_srs "$SRS900913" -f "ESRI Shapefile" \
+		"$TEMPDIR" "$SRCFILE" -nln $TEMPFILENAME $LAYERNAME
+	    
+	    # set up table(s)
+	    if [[ "$PREP_TABLE" && ! `TableExists $TABLE` ]]; then
+		echo "Creating $TABLE tables..."
+		$SETUPCMD "$TEMPFILE" $TABLE | $DBCMD
+		CreateFcodeIndex $TABLE
+		if [ ! -z $CREATE_MAJOR ]; then
+		    echo "CREATE TABLE ${TABLE}_major (LIKE $TABLE INCLUDING ALL);" | $DBCMD
+		fi
+		unset PREP_TABLE
+	    fi
+	    
+	    # import data
+	    echo "Importing $SRCFILE..."
+	    $IMPORTCMD "$TEMPFILE" ${NHD_TABLE_PREFIX}_${TABLESUFFIX} | $DBCMD
+	    
+	    # mark that we have imported this layer and subregion
+	    touch $CACHEFILE
+	else
+	    Debug "Subregion $s either cached or not properly downloaded... will not import" $TOPOSM_DEBUG
+	fi
+    done
+}
+
+
+pushd $NHD_DIR
+
 mkdir -pv "$TEMPDIR"
-rm -f $TEMPDIR/temp.{dbf,prj,shp,shx}
+mkdir -pv "$CACHEDIR"
+if [[ ! -z "$NO_NHD_CACHE" ]]; then
+    rm -f $CACHEDIR/*
+    echo "
+DROP TABLE IF EXISTS ${NHD_TABLE_PREFIX}_area_major, ${NHD_TABLE_PREFIX}_area,
+${NHD_TABLE_PREFIX}_flowline_major, ${NHD_TABLE_PREFIX}_flowline,
+${NHD_TABLE_PREFIX}_point, ${NHD_TABLE_PREFIX}_waterbody_major,
+${NHD_TABLE_PREFIX}_waterbody, ${NHD_TABLE_PREFIX}_line;
+" | $DBCMD
+fi
+
+if [[ ! `TableExists $WBD_TABLE` ]]; then MakeWBDTable; fi
+SUBREGIONS=$(GetSubregions)
+echo "Subregions: $SUBREGIONS"
+for s in $SUBREGIONS; do DownloadAndUnzip $s; done
 
 echo;echo "##### Area ####"
-ImportShapefiles "nhdarhi" "area" 1
+ImportLayers "NHDArea" "area" 1
 ExtractMajorFeatures "area" "areasqkm > 1"
-UpdateColumnDatatypes "area"
-UpdateColumnDatatypes "area_major"
-CreateFcodeIndex "area"
-CreateFcodeIndex "area_major"
 
 echo;echo "##### Flowline ####"
-ImportShapefiles "nhdflh" "flowline" 1
+ImportLayers "NHDFlowline" "flowline" 1
 ExtractMajorFeatures "flowline" "lengthkm > 2"
-UpdateColumnDatatypes "flowline"
-UpdateColumnDatatypes "flowline_major"
-CreateFcodeIndex "flowline"
-CreateFcodeIndex "flowline_major"
 
 echo;echo "##### Point ####"
-ImportShapefiles "nhdpthi" "point"
-UpdateColumnDatatypes "point"
-CreateFcodeIndex "point"
+ImportLayers "NHDPoint" "point"
 
 echo;echo "##### Waterbody ####"
-ImportShapefiles "nhdwbhi" "waterbody" 1
+ImportLayers "NHDWaterbody" "waterbody" 1
 ExtractMajorFeatures "waterbody" "areasqkm > 1"
-UpdateColumnDatatypes "waterbody"
-UpdateColumnDatatypes "waterbody_major"
-CreateFcodeIndex "waterbody"
-CreateFcodeIndex "waterbody_major"
 
 echo;echo "##### Line ####"
-ImportShapefiles "nhdlihi" "line"
-UpdateColumnDatatypes "line"
-CreateFcodeIndex "line"
+ImportLayers "NHDLine" "line"
+
+popd
 
 echo "Done."
+
+
